@@ -49,7 +49,7 @@ HomeLab Platform je end-to-end řešení pro monitoring privátního Kubernetes 
 | Frontend | Single-Page Application |
 | Backend | RESTful API |
 | Persistance | Relační DB + in-memory cache + time-series |
-| CI/CD | GitOps-inspired, self-hosted pipeline |
+| CI/CD | GitOps (ArgoCD), self-hosted CI (Gitea Actions) |
 | Provozní model | Infrastructure as Code (Kustomize) |
 
 ---
@@ -369,35 +369,62 @@ graph TB
 
 ## 7. CI/CD Pipeline
 
-### Workflow
+### GitOps model (Fáze 16)
 
 ```mermaid
 %%{init: {'theme': 'base', 'themeVariables': {'primaryColor': '#3b0764', 'primaryTextColor': '#f5f3ff', 'primaryBorderColor': '#7c3aed', 'lineColor': '#a78bfa', 'secondaryColor': '#1f2937', 'tertiaryColor': '#111827', 'clusterBkg': '#1e1b4b', 'clusterBorder': '#6d28d9', 'nodeBorder': '#7c3aed', 'titleColor': '#ddd6fe', 'edgeLabelBackground': '#1e1b4b', 'actorBkg': '#3b0764', 'actorBorder': '#7c3aed', 'actorTextColor': '#f5f3ff', 'actorLineColor': '#6d28d9', 'signalColor': '#a78bfa', 'signalTextColor': '#f5f3ff', 'noteBkgColor': '#2e1065', 'noteTextColor': '#ddd6fe', 'labelBoxBkgColor': '#3b0764', 'labelBoxBorderColor': '#7c3aed', 'labelTextColor': '#f5f3ff', 'loopTextColor': '#ddd6fe', 'activationBorderColor': '#7c3aed', 'activationBkgColor': '#2e1065', 'sequenceNumberColor': '#f5f3ff'}}}%%
 sequenceDiagram
     actor Dev as Developer
     participant Git as Gitea SCM
-    participant Hook as Webhook
     participant Runner as act_runner
-    participant Build as Docker Build
     participant Reg as Container Registry
+    participant Argo as ArgoCD
     participant K8s as Kubernetes
 
-    Dev->>Git: git push (main branch)
-    Git->>Hook: path filter match\n(apps/** nebo k8s/**)
-    Hook->>Runner: trigger workflow job
+    Dev->>Git: git push (apps/**)
+    Git->>Runner: trigger deploy workflow
     Runner->>Git: actions/checkout@v4
-    Runner->>Reg: docker login (TLS + htpasswd)
-    Runner->>Build: docker build (ARM64 native)
-    Build-->>Runner: image ready
-    Runner->>Reg: docker push
-    Reg-->>Runner: push confirmed
-    Runner->>K8s: microk8s kubectl set image
+    Runner->>Reg: docker build ARM64\n+ push image:git-SHA
+    Runner->>Git: sed image tag v deployment.yaml\ngit commit [skip ci]\ngit push (GITEA_TOKEN)
+    Git-->>Argo: ArgoCD polling detekuje změnu
+    Argo->>Git: clone manifesty (repoURL intern DNS)
+    Argo->>K8s: kubectl apply (nový image tag)
     K8s->>Reg: imagePull (TLS + imagePullSecret)
-    K8s-->>Runner: rollout status OK
-    Runner-->>Git: ✅ workflow SUCCESS
+    K8s-->>Argo: rollout Healthy
+    Argo-->>Dev: ✅ Synced + Healthy
 ```
 
-### Path-based triggering
+### ArgoCD Application CRD
+
+```mermaid
+%%{init: {'theme': 'base', 'themeVariables': {'primaryColor': '#3b0764', 'primaryTextColor': '#f5f3ff', 'primaryBorderColor': '#7c3aed', 'lineColor': '#a78bfa', 'secondaryColor': '#1f2937', 'tertiaryColor': '#111827', 'clusterBkg': '#1e1b4b', 'clusterBorder': '#6d28d9', 'nodeBorder': '#7c3aed', 'titleColor': '#ddd6fe', 'edgeLabelBackground': '#1e1b4b', 'actorBkg': '#3b0764', 'actorBorder': '#7c3aed', 'actorTextColor': '#f5f3ff', 'actorLineColor': '#6d28d9', 'signalColor': '#a78bfa', 'signalTextColor': '#f5f3ff', 'noteBkgColor': '#2e1065', 'noteTextColor': '#ddd6fe', 'labelBoxBkgColor': '#3b0764', 'labelBoxBorderColor': '#7c3aed', 'labelTextColor': '#f5f3ff', 'loopTextColor': '#ddd6fe', 'activationBorderColor': '#7c3aed', 'activationBkgColor': '#2e1065', 'sequenceNumberColor': '#f5f3ff'}}}%%
+graph TB
+    subgraph ArgoCD["ArgoCD  (namespace: argocd)"]
+        direction LR
+        AC["Application Controller\n(reconciler)"]
+        RS["Repo Server\n(git clone + kustomize)"]
+        GW["API Server\n(UI + gRPC)"]
+    end
+
+    subgraph Apps["Managed Applications"]
+        A1["app: homelab\npath: k8s/\nns: homelab"]
+        A2["app: gitea\npath: k8s/gitea\nns: gitea"]
+        A3["app: registry\npath: k8s/registry\nns: registry"]
+        A4["app: backup\npath: k8s/backup\nns: backup"]
+    end
+
+    subgraph Policy["Sync Policy"]
+        SP["automated:\n  prune: true\n  selfHeal: true\nsyncOptions:\n  CreateNamespace=true"]
+    end
+
+    Git["Gitea SCM\ngitea.gitea.svc\n:3000"] -->|"poll (3 min)"| RS
+    RS -->|"kustomize build"| AC
+    AC -->|"diff + apply"| K8s["Kubernetes API"]
+    SP --> AC
+    Apps --> AC
+```
+
+### Path-based triggering (CI)
 
 ```mermaid
 %%{init: {'theme': 'base', 'themeVariables': {'primaryColor': '#3b0764', 'primaryTextColor': '#f5f3ff', 'primaryBorderColor': '#7c3aed', 'lineColor': '#a78bfa', 'secondaryColor': '#1f2937', 'tertiaryColor': '#111827', 'clusterBkg': '#1e1b4b', 'clusterBorder': '#6d28d9', 'nodeBorder': '#7c3aed', 'titleColor': '#ddd6fe', 'edgeLabelBackground': '#1e1b4b', 'actorBkg': '#3b0764', 'actorBorder': '#7c3aed', 'actorTextColor': '#f5f3ff', 'actorLineColor': '#6d28d9', 'signalColor': '#a78bfa', 'signalTextColor': '#f5f3ff', 'noteBkgColor': '#2e1065', 'noteTextColor': '#ddd6fe', 'labelBoxBkgColor': '#3b0764', 'labelBoxBorderColor': '#7c3aed', 'labelTextColor': '#f5f3ff', 'loopTextColor': '#ddd6fe', 'activationBorderColor': '#7c3aed', 'activationBkgColor': '#2e1065', 'sequenceNumberColor': '#f5f3ff'}}}%%
@@ -405,9 +432,13 @@ graph LR
     Push["git push\nmain branch"]
 
     Push --> Filter{Path filter}
-    Filter -->|"apps/homelab-api/**\nk8s/homelab-api/**"| WF_API["deploy-api.yml\nbuild + push + deploy"]
-    Filter -->|"apps/homelab-ui/**\nk8s/homelab-ui/**"| WF_UI["deploy-ui.yml\nbuild + push + deploy"]
+    Filter -->|"apps/homelab-api/**"| WF_API["deploy-api.yml\nbuild + push + manifest update"]
+    Filter -->|"apps/homelab-ui/**"| WF_UI["deploy-ui.yml\nbuild + push + manifest update"]
+    Filter -->|"k8s/** (přímá změna)"| Argo["ArgoCD\nauto-sync (poll)"]
     Filter -->|"jiné soubory"| Skip["(žádný workflow)"]
+
+    WF_API -->|"git commit [skip ci]"| Argo
+    WF_UI -->|"git commit [skip ci]"| Argo
 ```
 
 ---
@@ -740,6 +771,7 @@ graph TB
         OB["observability ✅\nPrometheus, Loki"]
         RG["registry ✅\nContainer Registry"]
         BK["backup ✅\nCronJobs"]
+        AR["argocd ✅\nGitOps CD"]
     end
 
     subgraph Shared["Sdílená infrastruktura"]
@@ -752,7 +784,8 @@ graph TB
     GT_FAIL -.->|"izolováno"| OB
     GT_FAIL -.->|"izolováno"| RG
     GT_FAIL -.->|"izolováno"| BK
-    CP & DNS & MLB -->|"sdílené, nezávislé"| HM & OB & RG & BK
+    GT_FAIL -.->|"izolováno"| AR
+    CP & DNS & MLB -->|"sdílené, nezávislé"| HM & OB & RG & BK & AR
 ```
 
 ---
@@ -767,7 +800,7 @@ graph TB
 | **PostgreSQL** | Single instance | DB down = API degraded, Gitea down | Nightly pg_dump na separátní SSD |
 | **Gitea** | Single instance | SCM nedostupné | Záloha repozitářů, GitHub mirror |
 | **Container Registry** | Single instance | CI/CD nelze pushovat image | K8s stále běží z posledního image (cached) |
-| **act_runner** | Single instance na worker-6 | CI/CD zastaveno | Manuální deploy via kubectl |
+| **act_runner** | Single instance na rpi-master-1 | CI (build) zastaveno – CD (ArgoCD) stále funkční | Manuální build + manifest update; ArgoCD nasadí sám |
 | **Ingress Controller** | Single pod | Dashboard nedostupný | MetalLB failover na jiný node |
 
 ### Cesta k plné HA (roadmap)
@@ -784,15 +817,15 @@ graph LR
 
     subgraph HA["Production HA target"]
         H1["PostgreSQL\nHA (Patroni / CloudNativePG)\nreplicas: 3, streaming replication"]
-        H2["Gitea\nreplicas: N + shared storage\n(CephFS / NFS)"]
-        H3["Registry\nHA + geo-replication\n(Harbor)"]
+        H2["Gitea\nreplicas: N + CephFS\n(Rook-Ceph RWX)"]
+        H3["Registry\nHA + image scanning\n(Harbor)"]
         H4["Backup\nContinuous WAL archiving\nRPO: minutes"]
     end
 
-    N1 -.->|"Fáze 15?"| H1
-    N2 -.->|"Fáze 16?"| H2
-    N3 -.->|"Fáze 17?"| H3
-    N4 -.->|"Fáze 15?"| H4
+    N1 -.->|"Fáze 17"| H1
+    N2 -.->|"Fáze 18+19"| H2
+    N3 -.->|"Fáze 18+20"| H3
+    N4 -.->|"Fáze 17"| H4
 ```
 
 ---
@@ -859,6 +892,13 @@ timeline
         Fáze 14 : Backup & Recovery
                 : K8s CronJobs
                 : pg_dump + rsync přes SSH
+    section GitOps & HA
+        Fáze 15 : TLS homelab.local
+                : cert-manager Certificate
+                : HTTP→HTTPS redirect
+        Fáze 16 : ArgoCD GitOps CD
+                : Application CRD, auto-sync
+                : drift detection, selfHeal
 ```
 
 ### Architekturní evoluce
@@ -892,7 +932,12 @@ graph LR
         D5["Backup\nCronJobs"]
     end
 
-    F1_3 --> F4_6 --> F7_9 --> F10_14
+    subgraph F15_16["Fáze 15–16: GitOps"]
+        E1["TLS\nhomelab.local"]
+        E2["ArgoCD\nGitOps CD"]
+    end
+
+    F1_3 --> F4_6 --> F7_9 --> F10_14 --> F15_16
 ```
 
 ### Klíčová architektonická rozhodnutí
@@ -903,6 +948,9 @@ graph LR
 | Container registry | Self-hosted + TLS | Citlivé interní images, no vendor lock-in |
 | TLS strategie | cert-manager + self-signed CA | Automatická obnova, distribuce přes trust stores |
 | CI/CD runner | self-hosted na clusteru | Docker daemon přístup k lokální registry bez NAT |
+| CD strategie | ArgoCD GitOps | Deklarativní stav, drift detection, rollback přes Git; oddělení CI (Gitea Actions) od CD (ArgoCD) |
+| ArgoCD repoURL | ClusterIP DNS místo `gitea.local` | CoreDNS nerozumí `.local` – nutný FQDN `gitea.gitea.svc.cluster.local` |
+| ArgoCD install | `--server-side` apply | install.yaml > 262KB překračuje client-side annotation limit |
 | Storage pro Gitea/Registry | Lokální SSD s nodeAffinity | Výkon na ARM64, není potřeba distribuovaný storage |
 | Zálohovací transport | rsync přes SSH | Jednoduché, spolehlivé, žádná závislost na sdíleném storage |
 | Cache invalidace | TTL 30 s + `@Scheduled` evict | Prometheus na RPi je pomalý – cacheování kritické pro UX |
@@ -923,10 +971,11 @@ graph TB
         OB["observability\n── prometheus\n── grafana\n── loki\n── tempo"]
         CM["cert-manager\n── cert-manager\n── CA secret"]
         BK["backup\n── cronjob-postgres\n── cronjob-gitea\n── cronjob-registry"]
+        AR["argocd\n── argocd-server\n── application-controller\n── repo-server\n── redis\n── dex-server"]
     end
 ```
 
 ---
 
-*Dokument generován: 2026-05-02*  
+*Dokument aktualizován: 2026-05-03 (Fáze 15–16: TLS homelab.local, ArgoCD GitOps CD)*  
 *Projekt: PROJEKTIL / HomeLab Dashboard*
