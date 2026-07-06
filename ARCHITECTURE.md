@@ -149,8 +149,8 @@ graph TB
 
         subgraph Workers["Worker Nodes"]
             W1["worker-1\n● Primary Storage\n  Gitea data\n  Container Registry"]
-            W2["worker-2\nGeneral workload"]
-            W3["worker-3\nGeneral workload"]
+            W2["worker-2\n● Observability\n  Prometheus\n  (nodeSelector)"]
+            W3["worker-3\n● AI/LLM\n  Hermes + Ollama"]
             W4["worker-4\n● Backup Storage\n  pg_dump\n  rsync zálohy"]
             W5["worker-5\nGeneral workload"]
             W6["worker-6\n● CI/CD\n  act_runner"]
