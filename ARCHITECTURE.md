@@ -569,8 +569,8 @@ graph TB
 graph LR
     subgraph W1["worker-1  (SSD 465 GB)"]
         SSD1["/mnt/storage-1\n(Longhorn datový disk)"]
-        SSD1 --- G["Longhorn PVC\ngitea-data 200 Gi"]
-        SSD1 --- R["Longhorn PVC\nregistry-data 200 Gi"]
+        SSD1 --- G["Longhorn PVC\ngitea-data 10 Gi"]
+        SSD1 --- R["Longhorn PVC\nregistry-data 50 Gi"]
     end
 
     subgraph W4["worker-4  (SSD 465 GB)"]
@@ -956,6 +956,7 @@ graph LR
 | ArgoCD repoURL | ClusterIP DNS místo `gitea.local` | CoreDNS nerozumí `.local` – nutný FQDN `gitea.gitea.svc.cluster.local` |
 | ArgoCD install | `--server-side` apply | install.yaml > 262KB překračuje client-side annotation limit |
 | Storage pro Gitea/Registry | Longhorn (Fáze 17) – nahradil local-storage | Dynamic provisioner, 2 repliky, odpadá nodeAffinity – data přežijí výpadek nodu |
+| Recreate strategy pro postgres deployments s RWO PVC | `strategy: type: Recreate` | RWO PVC nelze mountovat na více nodech současně – RollingUpdate způsobuje deadlock při přeplánování na jiný node; Recreate nejprve ukončí starý pod |
 | Zálohovací transport | rsync přes SSH | Jednoduché, spolehlivé, žádná závislost na sdíleném storage |
 | Cache invalidace | TTL 30 s + `@Scheduled` evict | Prometheus na RPi je pomalý – cacheování kritické pro UX |
 | K8s distribuce | MicroK8s | Nízký overhead, snadná instalace na RPi, HA control plane |
@@ -981,5 +982,5 @@ graph TB
 
 ---
 
-*Dokument aktualizován: 2026-07-06 (Fáze 17: Longhorn distributed storage – nahrazuje local-storage + microk8s-hostpath, backup CronJoby přesunuty do app namespace)*  
+*Dokument aktualizován: 2026-07-06 (Fáze 17: Longhorn distributed storage – nahrazuje local-storage + microk8s-hostpath, backup CronJoby přesunuty do app namespace; reálné PVC velikosti: gitea 10 Gi, registry 50 Gi, backup 80 Gi; kubeletRootDir fix, PGDATA subdir, Recreate strategy pro RWO deployments)*  
 *Projekt: PROJEKTIL / HomeLab Dashboard*
