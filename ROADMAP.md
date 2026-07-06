@@ -858,7 +858,88 @@ https://argocd.local   # username: admin, password: viz argocd-initial-admin-sec
 
 ---
 
-## Fáze 17 – PostgreSQL HA (CloudNativePG)
+## Fáze 17 – Longhorn Storage ✅
+
+**Naučil ses:** Distributed block storage, Helm install, dynamic provisioner, PVC namespace isolation, backup CronJob architektura
+
+Cíl: nahradit statické `local-storage` PV a `microk8s-hostpath` za Longhorn – dynamic distributed block storage s 2 replikami.
+
+**Co se změnilo:**
+
+| Před | Po |
+|---|---|
+| `local-storage` StorageClass (no-provisioner) | `longhorn` (dynamic, výchozí) |
+| 3 statické PV s nodeAffinity | žádné PV – Longhorn provisioner vytváří automaticky |
+| `microk8s-hostpath` pro gitea-postgres | `longhorn` |
+| backup CronJoby v namespace `backup` s hostPath | CronJoby v app namespace, mountují PVC přímo |
+| `backup-storage` na hostPath worker-4 | Longhorn PVC `backup-storage` 400 Gi |
+
+**Architektura backup CronJobů po migraci:**
+
+```
+namespace: backup
+  cronjob-postgres  → Longhorn PVC backup-storage → pg_dump homelab + gitea DB
+
+namespace: gitea
+  cronjob-gitea-backup → PVC gitea-data (mount) → rsync SSH → worker-4:/mnt/storage-2/backups/gitea/
+
+namespace: registry
+  cronjob-registry-backup → PVC registry-data (mount) → rsync SSH → worker-4:/mnt/storage-2/backups/registry/
+```
+
+**Helm install:**
+```bash
+helm repo add longhorn https://charts.longhorn.io && helm repo update
+
+# Prerekvizita open-iscsi na každém nodu
+kubectl apply -f https://raw.githubusercontent.com/longhorn/longhorn/v1.7.0/deploy/prerequisite/longhorn-iscsi-installation.yaml
+
+helm install longhorn longhorn/longhorn \
+  --namespace longhorn-system --create-namespace \
+  --values k8s/longhorn/values.yaml --version 1.7.0
+```
+
+**Kopírování SSH secret do app namespace (jednorázově):**
+```bash
+kubectl get secret backup-ssh-key -n backup -o yaml \
+  | sed 's/namespace: backup/namespace: gitea/' | kubectl apply -f -
+kubectl get secret backup-ssh-key -n backup -o yaml \
+  | sed 's/namespace: backup/namespace: registry/' | kubectl apply -f -
+```
+
+**Nasazení:**
+```bash
+kubectl apply -k k8s/gitea/
+kubectl apply -k k8s/registry/
+kubectl apply -k k8s/backup/
+```
+
+**Klíčové koncepty:**
+- Longhorn dynamic provisioner – PVC vytvoří volume automaticky bez manuálního PV
+- Repliky (2) – data jsou na 2 různých nodech → výpadek worker-1 neztratí data
+- PVC jsou namespace-scoped – backup CronJob v `backup` namespace nemůže mountovat PVC z `gitea` namespace → proto jsou gitea/registry backup CronJoby přesunuty do svých namespace
+- RWO concurrent mount – Longhorn dovoluje mount RWO volume z více podů na STEJNÉM nodu (app pod + backup pod)
+- `Retain` reclaim policy – data přežijí smazání PVC
+
+**Ověření:**
+```bash
+kubectl get storageclass
+# → longhorn (default) ✅
+
+kubectl get pvc -n gitea
+# → gitea-data: Bound, longhorn ✅
+
+kubectl get pvc -n backup
+# → backup-storage: Bound, longhorn ✅
+
+# Longhorn UI
+echo "192.168.10.242 longhorn.local" | sudo tee -a /etc/hosts
+# → http://longhorn.local
+```
+
+---
+
+## Fáze 18 – PostgreSQL HA (CloudNativePG)
 
 **Naučíš se:** K8s Operator pattern, CRD (Custom Resource Definition), PostgreSQL streaming replication, WAL archiving
 
@@ -907,86 +988,18 @@ kubectl get cluster -n homelab -w
 
 ---
 
-## Fáze 18 – Distributed Storage (Rook-Ceph)
-
-**Naučíš se:** CSI driver, Ceph architektura (MON/OSD/MGR/MDS), CephFS pro RWX, Rook operator, StorageClass replikace
-
-Cíl: nahradit `local-storage` StorageClass (single-node, bez replikace) za Rook-Ceph (distribuovaný storage replikovaný přes worker nody). Prerequisita pro Gitea HA (CephFS RWX) a Harbor (blokový storage).
-
-**Proč Rook-Ceph (ne Longhorn):**
-- Ceph je enterprise storage standard (OpenStack, Red Hat ODF, SUSE Harvester)
-- Rook je CNCF graduated projekt – production-grade K8s operator pro Ceph
-- CephFS nativně podporuje RWX (ReadWriteMany)
-- Bonus: Ceph Object Storage (S3-compatible) otevírá cestu k object storage workloadům
-- Uživatel Ceph zná z práce → přímá aplikovatelnost zkušeností
-
-**Ceph komponenty:**
-| Komponenta | Role | Počet | RAM / instance |
-|---|---|---|---|
-| MON (Monitor) | Cluster state, quorum (Raft) | 3 | ~500 MB |
-| OSD (Object Storage Daemon) | Fyzické ukládání dat | ≥3 | ~1 GB |
-| MGR (Manager) | Metriky, dashboard, moduly | 2 (active+standby) | ~500 MB |
-| MDS (Metadata Server) | CephFS metadata | 2 (active+standby) | ~500 MB |
-
-**OSD strategie pro tento cluster:**
-- **worker-2, worker-3, worker-6** (RPi 5, 8 GB) → directory-based OSD (`/var/lib/rook/osd`) na OS disku
-- Alternativa: dedikovaný oddíl na SSD worker-1 a worker-4
-- Replikace factor: 3 (každý blok na 3 různých nodech)
-
-**Architektura:**
-```
-k8s/rook-ceph/
-  kustomization.yaml
-  namespace.yaml              <- namespace: rook-ceph
-  crds.yaml                   <- Rook CRD definice
-  operator.yaml               <- Rook operator deployment
-  cluster.yaml                <- CephCluster CR (OSD konfigurace)
-  storageclass-rbd.yaml       <- StorageClass ceph-block (RWO, RBD)
-  storageclass-cephfs.yaml    <- StorageClass ceph-filesystem (RWX, CephFS)
-  filesystem.yaml             <- CephFilesystem CR (MDS)
-  ingress.yaml                <- Ceph Dashboard na ceph.local
-```
-
-**Klíčové koncepty:**
-- `CephCluster` CRD – deklarativní definice celého Ceph clusteru
-- CRUSH map – Ceph algoritmus pro distribuci dat bez centrálního indexu
-- RBD (RADOS Block Device) – blokový storage pro RWO volumes (databáze)
-- CephFS – distribuovaný filesystem pro RWX volumes (Gitea, sdílená data)
-- Ceph Object Storage (RGW) – S3-compatible API (volitelné rozšíření)
-- Replikace factor – kolik kopií každého bloku (výchozí 3 = přežije výpadek 2 nodů)
-
-**Prerequisity před instalací:**
-```bash
-# Na všech worker nodech:
-sudo apt install lvm2
-# Volitelně pro lepší výkon:
-sudo apt install ceph-common
-```
-
-**Ověření:**
-```bash
-kubectl get cephcluster -n rook-ceph
-kubectl get pods -n rook-ceph
-# Ceph Dashboard: https://ceph.local
-# Status clusteru:
-kubectl exec -n rook-ceph deploy/rook-ceph-tools -- ceph status
-kubectl exec -n rook-ceph deploy/rook-ceph-tools -- ceph osd status
-```
-
----
-
 ## Fáze 19 – Gitea HA
 
 **Naučíš se:** Horizontal scaling stateful aplikace, RWX storage, session affinity, PVC migrace
 
 Cíl: Gitea běží ve více replikách (replicas: 3) na sdíleném Longhorn RWX volume. Výpadek jednoho podu neovlivní dostupnost SCM.
 
-**Prerequisity:** Fáze 16 (CloudNativePG pro Gitea DB) + Fáze 17 (Longhorn RWX)
+**Prerequisity:** Fáze 18 (CloudNativePG pro Gitea DB) + Fáze 17 (Longhorn – pro RWX přepnout storageClass na `longhorn-rwx`)
 
 **Změny:**
 ```
 k8s/gitea/
-  deployment.yaml   <- replicas: 1 -> 3, PVC: local-storage -> longhorn-rwx
+  deployment.yaml   <- replicas: 1 -> 3, PVC: longhorn -> longhorn-rwx
   pvc-gitea.yaml    <- storageClassName: longhorn-rwx, accessMode: RWX
   service.yaml      <- SessionAffinity: ClientIP
 ```
@@ -1018,7 +1031,7 @@ curl -I https://gitea.local  # musí stále odpovídat
 
 Cíl: nahradit `registry:2` za Harbor – enterprise-grade registry s HA, image scanningem a RBAC.
 
-**Prerequisity:** Fáze 17 (Longhorn – Harbor potřebuje více PVC pro jednotlivé komponenty)
+**Prerequisity:** Fáze 17 (Longhorn ✅ – Harbor potřebuje více PVC pro jednotlivé komponenty)
 
 **Proč Harbor:**
 - HA architektura (core, jobservice, registry, database, redis – vše separátně)

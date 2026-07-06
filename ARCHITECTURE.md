@@ -536,17 +536,17 @@ graph TB
     subgraph Sources["Datové zdroje"]
         PG1[("PostgreSQL\nhomelab DB")]
         PG2[("PostgreSQL\ngitea DB")]
-        GitData["Gitea data\n/mnt/storage-1/gitea\n(worker-1 SSD)"]
-        RegData["Registry layers\n/mnt/storage-1/registry\n(worker-1 SSD)"]
+        GitData["Gitea data\nLonghorn PVC gitea-data\n(ns: gitea)"]
+        RegData["Registry layers\nLonghorn PVC registry-data\n(ns: registry)"]
     end
 
-    subgraph CronJobs["K8s CronJobs  (namespace: backup)"]
-        CJ1["postgres-backup\n🕑 02:00 nightly\npg_dump → SQL file\nRotace: 7 dní"]
-        CJ2["gitea-backup\n🕒 03:00 nightly\nrsync přes SSH\ninkrementální"]
-        CJ3["registry-backup\n🕓 04:00 nightly\nrsync přes SSH\ninkrementální"]
+    subgraph CronJobs["K8s CronJobs  (distribuováno do app namespace – Fáze 17)"]
+        CJ1["postgres-backup\n🕑 02:00 nightly\nns: backup\npg_dump → Longhorn PVC\nRotace: 7 dní"]
+        CJ2["gitea-backup\n🕒 03:00 nightly\nns: gitea\nrsync PVC gitea-data\ninkrementální"]
+        CJ3["registry-backup\n🕓 04:00 nightly\nns: registry\nrsync PVC registry-data\ninkrementální"]
     end
 
-    subgraph Target["Zálohovací cíl  (worker-4 SSD)"]
+    subgraph Target["Zálohovací cíl  (worker-4 SSD /mnt/storage-2)"]
         BkpPG["backups/postgres/\nhomelab_YYYY-MM-DD.sql\ngitea_YYYY-MM-DD.sql"]
         BkpGit["backups/gitea/\n(rsync mirror)"]
         BkpReg["backups/registry/\n(rsync mirror)"]
@@ -554,8 +554,8 @@ graph TB
 
     PG1 -->|pg_dump| CJ1
     PG2 -->|pg_dump| CJ1
-    GitData -->|rsync SSH| CJ2
-    RegData -->|rsync SSH| CJ3
+    GitData -->|PVC mount + rsync SSH| CJ2
+    RegData -->|PVC mount + rsync SSH| CJ3
 
     CJ1 --> BkpPG
     CJ2 --> BkpGit
@@ -568,9 +568,9 @@ graph TB
 %%{init: {'theme': 'base', 'themeVariables': {'primaryColor': '#3b0764', 'primaryTextColor': '#f5f3ff', 'primaryBorderColor': '#7c3aed', 'lineColor': '#a78bfa', 'secondaryColor': '#1f2937', 'tertiaryColor': '#111827', 'clusterBkg': '#1e1b4b', 'clusterBorder': '#6d28d9', 'nodeBorder': '#7c3aed', 'titleColor': '#ddd6fe', 'edgeLabelBackground': '#1e1b4b', 'actorBkg': '#3b0764', 'actorBorder': '#7c3aed', 'actorTextColor': '#f5f3ff', 'actorLineColor': '#6d28d9', 'signalColor': '#a78bfa', 'signalTextColor': '#f5f3ff', 'noteBkgColor': '#2e1065', 'noteTextColor': '#ddd6fe', 'labelBoxBkgColor': '#3b0764', 'labelBoxBorderColor': '#7c3aed', 'labelTextColor': '#f5f3ff', 'loopTextColor': '#ddd6fe', 'activationBorderColor': '#7c3aed', 'activationBkgColor': '#2e1065', 'sequenceNumberColor': '#f5f3ff'}}}%%
 graph LR
     subgraph W1["worker-1  (SSD 465 GB)"]
-        SSD1["/mnt/storage-1"]
-        SSD1 --- G["gitea/\n(live data)"]
-        SSD1 --- R["registry/\n(image layers)"]
+        SSD1["/mnt/storage-1\n(Longhorn datový disk)"]
+        SSD1 --- G["Longhorn PVC\ngitea-data 200 Gi"]
+        SSD1 --- R["Longhorn PVC\nregistry-data 200 Gi"]
     end
 
     subgraph W4["worker-4  (SSD 465 GB)"]
@@ -598,10 +598,10 @@ graph LR
 | **Health Probes** | readinessProbe + livenessProbe na API | Žádný traffic na unhealthy pod |
 | **Rolling Update** | Deployment strategy (výchozí K8s) | Zero-downtime deploy |
 | **Cache Resilience** | Redis + `@Cacheable` TTL 30 s | Funkční API i při pomalém/nedostupném Prometheus |
-| **Data Durability** | PVC `Retain` policy | Data přežijí smazání podu i PVC |
+| **Data Durability** | PVC `Retain` policy + Longhorn replication | Data přežijí smazání podu i PVC; 2 repliky na různých nodech |
 | **Namespace Isolation** | 6 oddělených namespace | Blast radius – selhání jedné služby neovlivní ostatní |
 | **Backup & Recovery** | K8s CronJobs + rsync na dedikovaný node | RPO ≤ 24 h, data na fyzicky oddělené SSD |
-| **Node Affinity** | PV nodeAffinity na konkrétní worker | Deterministické umístění dat |
+| **Distributed Storage** | Longhorn (Fáze 17) – replicas: 2 | Výpadek worker-1 neztratí data (2. replika na jiném nodu) |
 
 ---
 
@@ -796,7 +796,7 @@ graph TB
 
 | Komponenta | Typ SPOF | Riziko | Mitigace v současném stavu |
 |---|---|---|---|
-| **worker-1** | Fyzický node | Výpadek node = ztráta Gitea + Registry | Záloha na worker-4 (nightly rsync) |
+| **worker-1** | Fyzický node | Výpadek node = dočasná nedostupnost Gitea + Registry | Longhorn replika na jiném nodu zajišťuje kontinuitu; záloha na worker-4 (nightly rsync) |
 | **PostgreSQL** | Single instance | DB down = API degraded, Gitea down | Nightly pg_dump na separátní SSD |
 | **Gitea** | Single instance | SCM nedostupné | Záloha repozitářů, GitHub mirror |
 | **Container Registry** | Single instance | CI/CD nelze pushovat image | K8s stále běží z posledního image (cached) |
@@ -892,13 +892,16 @@ timeline
         Fáze 14 : Backup & Recovery
                 : K8s CronJobs
                 : pg_dump + rsync přes SSH
-    section GitOps & HA
+    section GitOps & Storage
         Fáze 15 : TLS homelab.local
                 : cert-manager Certificate
                 : HTTP→HTTPS redirect
         Fáze 16 : ArgoCD GitOps CD
                 : Application CRD, auto-sync
                 : drift detection, selfHeal
+        Fáze 17 : Longhorn Storage
+                : dynamic provisioner
+                : replicas 2, backup CronJoby do app ns
 ```
 
 ### Architekturní evoluce
@@ -932,12 +935,13 @@ graph LR
         D5["Backup\nCronJobs"]
     end
 
-    subgraph F15_16["Fáze 15–16: GitOps"]
+    subgraph F15_17["Fáze 15–17: GitOps & Storage"]
         E1["TLS\nhomelab.local"]
         E2["ArgoCD\nGitOps CD"]
+        E3["Longhorn\nDistributed Storage"]
     end
 
-    F1_3 --> F4_6 --> F7_9 --> F10_14 --> F15_16
+    F1_3 --> F4_6 --> F7_9 --> F10_14 --> F15_17
 ```
 
 ### Klíčová architektonická rozhodnutí
@@ -951,7 +955,7 @@ graph LR
 | CD strategie | ArgoCD GitOps | Deklarativní stav, drift detection, rollback přes Git; oddělení CI (Gitea Actions) od CD (ArgoCD) |
 | ArgoCD repoURL | ClusterIP DNS místo `gitea.local` | CoreDNS nerozumí `.local` – nutný FQDN `gitea.gitea.svc.cluster.local` |
 | ArgoCD install | `--server-side` apply | install.yaml > 262KB překračuje client-side annotation limit |
-| Storage pro Gitea/Registry | Lokální SSD s nodeAffinity | Výkon na ARM64, není potřeba distribuovaný storage |
+| Storage pro Gitea/Registry | Longhorn (Fáze 17) – nahradil local-storage | Dynamic provisioner, 2 repliky, odpadá nodeAffinity – data přežijí výpadek nodu |
 | Zálohovací transport | rsync přes SSH | Jednoduché, spolehlivé, žádná závislost na sdíleném storage |
 | Cache invalidace | TTL 30 s + `@Scheduled` evict | Prometheus na RPi je pomalý – cacheování kritické pro UX |
 | K8s distribuce | MicroK8s | Nízký overhead, snadná instalace na RPi, HA control plane |
@@ -966,16 +970,16 @@ graph TB
     subgraph Namespaces["Kubernetes Namespaces"]
         direction LR
         HM["homelab\n── homelab-api\n── homelab-ui\n── postgres\n── redis"]
-        GT["gitea\n── gitea\n── postgres"]
-        RG["registry\n── registry"]
+        GT["gitea\n── gitea\n── postgres\n── cronjob-gitea-backup"]
+        RG["registry\n── registry\n── cronjob-registry-backup"]
         OB["observability\n── prometheus\n── grafana\n── loki\n── tempo"]
         CM["cert-manager\n── cert-manager\n── CA secret"]
-        BK["backup\n── cronjob-postgres\n── cronjob-gitea\n── cronjob-registry"]
+        BK["backup\n── cronjob-postgres\n── pvc backup-storage"]
         AR["argocd\n── argocd-server\n── application-controller\n── repo-server\n── redis\n── dex-server"]
     end
 ```
 
 ---
 
-*Dokument aktualizován: 2026-05-03 (Fáze 15–16: TLS homelab.local, ArgoCD GitOps CD)*  
+*Dokument aktualizován: 2026-07-06 (Fáze 17: Longhorn distributed storage – nahrazuje local-storage + microk8s-hostpath, backup CronJoby přesunuty do app namespace)*  
 *Projekt: PROJEKTIL / HomeLab Dashboard*
